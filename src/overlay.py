@@ -242,7 +242,7 @@ class ACCTimer(OverlayBase):
         self.last_sector_index = 0
         self.lap_start_cleared = True
         self.personal_bests = [9999999, 9999999, 9999999]
-        self.session_bests = [9999999, 9999999, 9999999]
+        self.session_global_bests = [9999999, 9999999, 9999999]
         self._penalty_short_baseline = -1
 
         self.s1_cum = 0
@@ -275,7 +275,7 @@ class ACCTimer(OverlayBase):
         self.last_sector_index = 0
         self.lap_start_cleared = True
         self.personal_bests = [9999999, 9999999, 9999999]
-        self.session_bests = [9999999, 9999999, 9999999]
+        self.session_global_bests = [9999999, 9999999, 9999999]
         self._penalty_short_baseline = -1
 
         self.s1_cum = 0
@@ -352,7 +352,7 @@ class ACCTimer(OverlayBase):
             self._pending_focused_car = None
         if focus is not None:
             self.my_car_index = focus
-        
+
         for c in batch.values():
             try:
                 self._merge_realtime_car(c)
@@ -360,6 +360,15 @@ class ACCTimer(OverlayBase):
                 import traceback
                 print(f"[Timer 数据解析报错] 车辆数据出错: {e}")
                 traceback.print_exc()
+
+        self._update_global_bests_from_cars()
+
+    def _update_global_bests_from_cars(self):
+        for data in self.cars_data.values():
+            splits = data.get("splits", [0, 0, 0])
+            for i in range(3):
+                if 0 < splits[i] < self.session_global_bests[i]:
+                    self.session_global_bests[i] = splits[i]
 
     def _merge_realtime_car(self, c):
         def get_attr(obj, names, default=None):
@@ -504,18 +513,16 @@ class ACCTimer(OverlayBase):
         if invalid:
             self.sector_colors[sector_idx] = "#c0392b"
             return
-        is_personal_best = False
-        is_session_best = False
-        if s_time < self.personal_bests[sector_idx]:
-            self.personal_bests[sector_idx] = s_time
-            is_personal_best = True
-        if s_time <= self.session_bests[sector_idx]:
-            self.session_bests[sector_idx] = s_time
-            is_session_best = True
 
-        if is_session_best: self.sector_colors[sector_idx] = "#9b59b6"
-        elif is_personal_best: self.sector_colors[sector_idx] = "#2ecc71"
-        else: self.sector_colors[sector_idx] = "#f1c40f"
+        if s_time < self.session_global_bests[sector_idx]:
+            self.session_global_bests[sector_idx] = s_time
+            self.personal_bests[sector_idx] = s_time
+            self.sector_colors[sector_idx] = "#9b59b6"
+        elif s_time < self.personal_bests[sector_idx]:
+            self.personal_bests[sector_idx] = s_time
+            self.sector_colors[sector_idx] = "#2ecc71"
+        else:
+            self.sector_colors[sector_idx] = "#f1c40f"
 
     def draw_opponent_row(self, painter, y_pos, fallback_pos, data):
         if data:
@@ -947,6 +954,10 @@ class ACCOverlay(OverlayBase):
 
         self.gas_history = deque([0.0] * self.history_length, maxlen=self.history_length)
         self.brake_history = deque([0.0] * self.history_length, maxlen=self.history_length)
+        self.abs_history = deque([False] * self.history_length, maxlen=self.history_length)
+        self.tc_history = deque([False] * self.history_length, maxlen=self.history_length)
+        self._abs_hold = 0
+        self._tc_hold = 0
 
         self.current_speed = 0
         self.current_gear_str = "-"
@@ -959,6 +970,9 @@ class ACCOverlay(OverlayBase):
         self.temp_max = 0
         self.temp_min = 999
         self.was_braking = False
+        self._blip_start_speed = None
+        self.abs_active = False
+        self.tc_active = False
 
         self.data_timer = QTimer(self)
         self.data_timer.timeout.connect(self.update_data)
@@ -989,20 +1003,22 @@ class ACCOverlay(OverlayBase):
         for i in range(1, 5):
             self.draw_line(painter, gx + gw * (i / 5), gy, gx + gw * (i / 5), gy + gh, color_grid)
 
-        gas_poly = QPolygonF()
-        brake_poly = QPolygonF()
         dx = gw / max(1, self.history_length - 1)
-        for i in range(self.history_length):
-            x = gx + i * dx
-            gas_poly.append(QPointF(x, gy + gh - (self.gas_history[i] * gh)))
-            brake_poly.append(QPointF(x, gy + gh - (self.brake_history[i] * gh)))
+        brake_pts = [QPointF(gx + i * dx, gy + gh - (self.brake_history[i] * gh)) for i in range(self.history_length)]
+        gas_pts = [QPointF(gx + i * dx, gy + gh - (self.gas_history[i] * gh)) for i in range(self.history_length)]
 
         if len(self.gas_history) >= 4:
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(color_brake), 2.5))
-            painter.drawPolyline(brake_poly)
-            painter.setPen(QPen(QColor(color_gas), 2.5))
-            painter.drawPolyline(gas_poly)
+
+            for i in range(self.history_length - 1):
+                c = "#f1c40f" if self.abs_history[i] else color_brake
+                painter.setPen(QPen(QColor(c), 2.5))
+                painter.drawLine(brake_pts[i], brake_pts[i + 1])
+
+            for i in range(self.history_length - 1):
+                c = "#f1c40f" if self.tc_history[i] else color_gas
+                painter.setPen(QPen(QColor(c), 2.5))
+                painter.drawLine(gas_pts[i], gas_pts[i + 1])
 
         bx = 290;
         by = 8;
@@ -1014,19 +1030,22 @@ class ACCOverlay(OverlayBase):
         self.draw_rect(painter, bx, by, bx + bw, by + bh, color_slot)
         self.draw_rect(painter, x_g, by, x_g + bw, by + bh, color_slot)
 
+        brake_fill = "#f1c40f" if self.abs_active else color_brake
+        gas_fill = "#f1c40f" if self.tc_active else color_gas
+
         if self.current_brake > 0:
-            self.draw_rect(painter, bx, by + bh - (self.current_brake * bh), bx + bw, by + bh, color_brake)
+            self.draw_rect(painter, bx, by + bh - (self.current_brake * bh), bx + bw, by + bh, brake_fill)
         if self.current_gas > 0:
-            self.draw_rect(painter, x_g, by + bh - (self.current_gas * bh), x_g + bw, by + bh, color_gas)
+            self.draw_rect(painter, x_g, by + bh - (self.current_gas * bh), x_g + bw, by + bh, gas_fill)
 
         y_gap = 3
-        b_top_color = color_brake if self.current_brake >= 0.99 else color_grid
-        b_bot_color = color_brake if self.current_brake <= 0.01 else color_grid
+        b_top_color = brake_fill if self.current_brake >= 0.99 else color_grid
+        b_bot_color = brake_fill if self.current_brake <= 0.01 else color_grid
         self.draw_line(painter, bx + 2, by - y_gap, bx + bw - 2, by - y_gap, b_top_color, 2)
         self.draw_line(painter, bx + 2, by + bh + y_gap, bx + bw - 2, by + bh + y_gap, b_bot_color, 2)
 
-        g_top_color = color_gas if self.current_gas >= 0.99 else color_grid
-        g_bot_color = color_gas if self.current_gas <= 0.01 else color_grid
+        g_top_color = gas_fill if self.current_gas >= 0.99 else color_grid
+        g_bot_color = gas_fill if self.current_gas <= 0.01 else color_grid
         self.draw_line(painter, x_g + 2, by - y_gap, x_g + bw - 2, by - y_gap, g_top_color, 2)
         self.draw_line(painter, x_g + 2, by + bh + y_gap, x_g + bw - 2, by + bh + y_gap, g_bot_color, 2)
 
@@ -1076,21 +1095,41 @@ class ACCOverlay(OverlayBase):
                 self.current_brake = physics.brake
                 self.gas_history.append(self.current_gas)
                 self.brake_history.append(self.current_brake)
+                self.abs_active = physics.abs > 0.01
+                self.tc_active = physics.tc > 0.01
 
-                if physics.brake > 0.05:
+                if self.abs_active:
+                    self._abs_hold = 8
+                else:
+                    self._abs_hold = max(0, self._abs_hold - 1)
+                if self.tc_active:
+                    self._tc_hold = 8
+                else:
+                    self._tc_hold = max(0, self._tc_hold - 1)
+                self.abs_history.append(self._abs_hold > 0)
+                self.tc_history.append(self._tc_hold > 0)
+
+                # 最低弯速：油门松开时记录最低速，重新踩下油门时锁存
+                # 速度趋势过滤：降档自动补油时速度仍在下降，不触发锁存
+                if physics.gas > 0.05:
                     if not self.was_braking:
+                        if self._blip_start_speed is None:
+                            self._blip_start_speed = physics.speedKmh
+                        if physics.speedKmh > self._blip_start_speed:
+                            self.min_speed = self.temp_min
+                            self.temp_max = physics.speedKmh
+                            self.was_braking = True
+                            self._blip_start_speed = None
+                    if self.was_braking and physics.speedKmh > self.temp_max:
+                        self.temp_max = physics.speedKmh
+                else:
+                    if self.was_braking:
                         self.top_speed = self.temp_max
                         self.temp_min = physics.speedKmh
-                        self.was_braking = True
+                        self.was_braking = False
+                    self._blip_start_speed = None
                     if physics.speedKmh < self.temp_min:
                         self.temp_min = physics.speedKmh
-                elif physics.gas > 0.05:
-                    if self.was_braking:
-                        self.min_speed = self.temp_min
-                        self.temp_max = physics.speedKmh
-                        self.was_braking = False
-                    if physics.speedKmh > self.temp_max:
-                        self.temp_max = physics.speedKmh
         except Exception:
             self.is_connected = False
         finally:
@@ -1113,6 +1152,7 @@ class ACCRadarOverlay(OverlayBase):
 
         self.track_data = {}
         self.my_car_index = None
+        self.current_session_type = -1
 
         # 车损数据 [Front, Rear, Left, Right, Center]
         self.car_damage = [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -1172,7 +1212,7 @@ class ACCRadarOverlay(OverlayBase):
             shm_physics.seek(0)
             data = shm_physics.read(ctypes.sizeof(SPageFilePhysics))
             physics = SPageFilePhysics.from_buffer_copy(data)
-            
+
             if physics.packetId > 0:
                 for i in range(5):
                     self.car_damage[i] = physics.carDamage[i]
@@ -1185,6 +1225,31 @@ class ACCRadarOverlay(OverlayBase):
         finally:
             if shm_physics is not None:
                 shm_physics.close()
+
+        # 检测 session 变更，清空上局残留的车辆数据
+        shm_graphics = None
+        try:
+            read_sz = ctypes.sizeof(SPageFileGraphics)
+            try:
+                shm_graphics = mmap.mmap(-1, read_sz, "acpmf_graphics", access=mmap.ACCESS_READ)
+            except FileNotFoundError:
+                shm_graphics = mmap.mmap(-1, read_sz, "Local\\acpmf_graphics", access=mmap.ACCESS_READ)
+            shm_graphics.seek(0)
+            raw = shm_graphics.read(read_sz)
+            gs = SPageFileGraphics.from_buffer_copy(raw)
+            if gs.packetId > 0:
+                if gs.session != self.current_session_type:
+                    self.current_session_type = gs.session
+                    self.track_data.clear()
+                    self.my_car_index = None
+            else:
+                self.track_data.clear()
+                self.my_car_index = None
+        except Exception:
+            pass
+        finally:
+            if shm_graphics is not None:
+                shm_graphics.close()
 
         self.update()
     

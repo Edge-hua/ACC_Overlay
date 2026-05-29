@@ -3,8 +3,23 @@ import subprocess
 import os
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QFrame, QMainWindow)
-from PyQt6.QtCore import Qt, QTimer, QSize, QPropertyAnimation, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QFont
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QPainter, QColor, QPixmap, QPolygonF, QPainterPath
+from PyQt6.QtCore import QPointF
+import math
+
+
+PURPLE = "#8b5cf6"
+GREEN_ON = "#22c55e"
+STAR_YELLOW = "#eab308"
+STAR_GRAY = "#2e2e32"
+BG_DARK = "#0c0c0e"
+BG_CARD = "#141417"
+BG_HOVER = "#1a1a1e"
+TEXT_PRIMARY = "#e4e4e7"
+TEXT_SECONDARY = "#71717a"
+TEXT_DIM = "#52525b"
+BORDER = "#222226"
 
 
 class ToggleSwitch(QWidget):
@@ -12,24 +27,18 @@ class ToggleSwitch(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(55, 28)
+        self.setFixedSize(44, 22)
         self._state = False
-        self._offset = 3
-        self.color_off = QColor("#44444a")
-        self.color_on = QColor("#32cd32")
-        self.color_handle = QColor("#ffffff")
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(self.color_on if self._state else self.color_off)
-        p.drawRoundedRect(0, 0, self.width(), self.height(), 14, 14)
-
-        p.setBrush(self.color_handle)
-        x_pos = self.width() - 25 if self._state else 3
-        p.drawEllipse(x_pos, 3, 22, 22)
+        p.setBrush(QColor(GREEN_ON) if self._state else QColor("#2e2e32"))
+        p.drawRoundedRect(0, 0, self.width(), self.height(), 11, 11)
+        p.setBrush(QColor("#ffffff"))
+        x = self.width() - 19 if self._state else 2
+        p.drawEllipse(x, 2, 18, 18)
 
     def mousePressEvent(self, event):
         self._state = not self._state
@@ -41,22 +50,36 @@ class ToggleSwitch(QWidget):
         self.update()
 
 
-class SelectDot(QWidget):
-    """模块选择标记：绿色圆点表示已选中，灰色表示未选中"""
+class StarDot(QWidget):
+    """五角星收藏标记：选中时金黄色，未选中时深灰"""
+
+    _STAR_POINTS = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(18, 18)
+        self.setFixedSize(16, 16)
         self._selected = True
-        self.color_on = QColor("#32cd32")
-        self.color_off = QColor("#44444a")
+
+    def _star_polygon(self, cx, cy, outer_r, inner_r):
+        """生成五角星多边形顶点，10个点交替外径/内径，从上方开始"""
+        pts = []
+        # 十个顶点，从正上方(-90°)顺时针
+        for i in range(10):
+            r = outer_r if i % 2 == 0 else inner_r
+            angle = math.radians(-90 + i * 36)
+            pts.append(QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle)))
+        return QPolygonF(pts)
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(self.color_on if self._selected else self.color_off)
-        p.drawEllipse(2, 2, 14, 14)
+        color = QColor(STAR_YELLOW) if self._selected else QColor(STAR_GRAY)
+        p.setBrush(color)
+        poly = self._star_polygon(8, 8, 7.5, 3.5)
+        path = QPainterPath()
+        path.addPolygon(poly)
+        p.drawPath(path)
 
     def mousePressEvent(self, event):
         self._selected = not self._selected
@@ -73,115 +96,222 @@ class SelectDot(QWidget):
 class ACCControlPanel(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ACC 赛车辅助工具箱")
-        # 【修改1】增加高度，从 370 增加到 410，以容纳新的模块行
-        self.setFixedSize(350, 410)
-        self.setStyleSheet("background-color: #222225;")
+        self.setWindowTitle("X-SPEED Racing · ACC 控制中心")
+        self.setFixedSize(320, 440)
+        self.setStyleSheet(f"background-color: {BG_DARK};")
 
-        # 【修改2】在进程字典中加入 "delta": None
-        self.processes = {"radar": None, "overlay": None, "tyres": None, "timer": None, "delta": None}
+        self.processes = {
+            "radar": None, "overlay": None, "tyres": None,
+            "timer": None, "delta": None
+        }
         self.switches = {}
         self.select_dots = {}
         self.game_running = False
 
         self.init_ui()
-
         self.check_timer = QTimer()
         self.check_timer.timeout.connect(self.check_game_status)
         self.check_timer.start(2000)
 
     def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(40, 20, 40, 10)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # 标题区
-        title = QLabel("仪表盘控制中心")
-        title.setStyleSheet("color: white; font-family: 'Microsoft YaHei'; font-size: 20px; font-weight: bold;")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        # ---- header ----
+        header = QFrame()
+        header.setFixedHeight(90)
+        header.setStyleSheet(f"background-color: {BG_DARK};")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(18, 14, 18, 14)
 
-        subtitle = QLabel("ASSETTO CORSA COMPETIZIONE")
-        subtitle.setStyleSheet("color: #55555d; font-family: Arial; font-size: 10px;")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(subtitle)
-        layout.addSpacing(15)
+        if getattr(sys, 'frozen', False):
+            base_dir = sys._MEIPASS
+        else:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        logo_path = os.path.join(base_dir, "config", "logo.jpg")
+        logo_lbl = QLabel()
+        if os.path.exists(logo_path):
+            logo_lbl.setPixmap(QPixmap(logo_path).scaled(
+                56, 56, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            ))
+        logo_lbl.setFixedSize(56, 56)
+        logo_lbl.setStyleSheet("border-radius: 28px;")
+        hl.addWidget(logo_lbl)
+        hl.addSpacing(12)
 
-        # 【修改3】在模块列表中加入 "实时秒差"
-        modules = [
-            ("相对雷达", "radar"), 
-            ("遥测踏板", "overlay"), 
-            ("轮胎面板", "tyres"), 
-            ("圈速计时", "timer"),
-            ("实时秒差", "delta")  # 新增的模块
-        ]
+        brand_block = QVBoxLayout()
+        brand_block.setSpacing(0)
 
-        # 总开关行
-        master_row = QFrame()
-        master_layout = QHBoxLayout(master_row)
-        master_layout.setContentsMargins(0, 5, 0, 5)
+        brand = QLabel("X-SPEED")
+        brand.setStyleSheet(
+            f"color: {PURPLE}; font-family: 'Arial Black'; font-size: 20px; "
+            "font-weight: 900; letter-spacing: 2px;"
+        )
+        brand_block.addWidget(brand)
+
+        sub = QLabel("RACING")
+        sub.setStyleSheet(
+            "color: #ffffff; font-family: 'Arial Black'; font-size: 11px; "
+            "font-weight: 900; letter-spacing: 8px; padding-left: 1px;"
+        )
+        brand_block.addWidget(sub)
+
+        acc = QLabel("ACC 控制中心")
+        acc.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-family: 'Microsoft YaHei'; font-size: 10px; padding-left: 1px;"
+        )
+        brand_block.addWidget(acc)
+
+        hl.addLayout(brand_block)
+        hl.addStretch()
+        layout.addWidget(header)
+
+        # ---- divider ----
+        div = QFrame()
+        div.setFixedHeight(1)
+        div.setStyleSheet(f"background-color: {BORDER};")
+        layout.addWidget(div)
+
+        # ---- body ----
+        body = QFrame()
+        body.setStyleSheet(f"background-color: {BG_DARK};")
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(14, 14, 14, 8)
+        bl.setSpacing(6)
+
+        # master row
+        master = QFrame()
+        master.setStyleSheet(f"""
+            QFrame {{
+                background-color: {BG_CARD};
+                border-radius: 6px;
+                border: 1px solid {BORDER};
+            }}
+        """)
+        master.setFixedHeight(38)
+        ml = QHBoxLayout(master)
+        ml.setContentsMargins(12, 0, 10, 0)
 
         master_lbl = QLabel("一键启动")
-        master_lbl.setStyleSheet("color: #ffcc00; font-family: 'Microsoft YaHei'; font-size: 14px; font-weight: bold;")
+        master_lbl.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-family: 'Microsoft YaHei'; font-size: 13px;"
+        )
+        ml.addWidget(master_lbl)
+        ml.addStretch()
 
         self.master_switch = ToggleSwitch()
         self.master_switch.clicked.connect(self.handle_master_toggle)
+        ml.addWidget(self.master_switch)
+        bl.addWidget(master)
 
-        master_layout.addWidget(master_lbl)
-        master_layout.addStretch()
-        master_layout.addWidget(self.master_switch)
-        layout.addWidget(master_row)
+        # section label
+        bl.addSpacing(6)
+        sec = QLabel("模块")
+        sec.setStyleSheet(
+            f"color: {TEXT_DIM}; font-family: 'Microsoft YaHei'; font-size: 10px; "
+            "font-weight: bold; letter-spacing: 2px; padding-left: 2px;"
+        )
+        bl.addWidget(sec)
 
-        # 分隔线
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("background-color: #333338;")
-        sep.setFixedHeight(1)
-        layout.addWidget(sep)
+        modules = [
+            ("相对雷达",     "radar"),
+            ("遥测踏板",     "overlay"),
+            ("轮胎面板",     "tyres"),
+            ("圈速计时",     "timer"),
+            ("实时秒差",     "delta"),
+        ]
 
         for name, key in modules:
-            row = QFrame()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 5, 0, 5)
-
-            dot = SelectDot()
-            self.select_dots[key] = dot
+            card = QFrame()
+            card.setFixedHeight(36)
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {BG_CARD};
+                    border-radius: 5px;
+                    border: 1px solid transparent;
+                }}
+                QFrame:hover {{
+                    background-color: {BG_HOVER};
+                    border: 1px solid #2a2a2f;
+                }}
+            """)
+            rl = QHBoxLayout(card)
+            rl.setContentsMargins(12, 0, 8, 0)
 
             lbl = QLabel(name)
-            lbl.setStyleSheet("color: #dcdcdc; font-family: 'Microsoft YaHei'; font-size: 14px;")
+            lbl.setStyleSheet(
+                f"color: {TEXT_PRIMARY}; font-family: 'Microsoft YaHei'; font-size: 13px;"
+            )
+            rl.addWidget(lbl)
+            rl.addStretch()
+
+            dot = StarDot()
+            self.select_dots[key] = dot
 
             switch = ToggleSwitch()
-            switch.clicked.connect(lambda s, k=key, w=switch: self.handle_toggle(s, k, w))
+            switch.clicked.connect(lambda s, k=key: self.handle_toggle(s, k))
             self.switches[key] = switch
 
-            row_layout.addWidget(lbl)
-            row_layout.addStretch()
-            row_layout.addWidget(dot)
-            row_layout.addSpacing(8)
-            row_layout.addWidget(switch)
-            layout.addWidget(row)
+            rl.addWidget(dot)
+            rl.addSpacing(8)
+            rl.addWidget(switch)
+            bl.addWidget(card)
 
-        # 底部状态栏
-        self.status_bar = QLabel("系统就绪")
-        self.status_bar.setStyleSheet("color: #666666; font-size: 12px; background-color: #1a1a1d; padding: 5px;")
-        self.status_bar.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.statusBar().addPermanentWidget(self.status_bar)
-   
+        bl.addStretch()
+
+        # status
+        status = QFrame()
+        status.setFixedHeight(28)
+        sl = QHBoxLayout(status)
+        sl.setContentsMargins(16, 0, 16, 0)
+
+        self.status_dot = QLabel()
+        self.status_dot.setFixedSize(6, 6)
+        self.status_dot.setStyleSheet("background-color: #52525b; border-radius: 3px;")
+        sl.addWidget(self.status_dot)
+        sl.addSpacing(6)
+
+        self.status_bar = QLabel("游戏未启动")
+        self.status_bar.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-family: 'Microsoft YaHei'; font-size: 10px;"
+        )
+        sl.addWidget(self.status_bar)
+        sl.addStretch()
+
+        bl.addWidget(status)
+        layout.addWidget(body)
+
+    # ---- logic ----
+
     def check_game_status(self):
         try:
-            output = subprocess.check_output('tasklist', creationflags=subprocess.CREATE_NO_WINDOW).decode('mbcs',
-                                                                                                           'ignore').lower()
-            self.game_running = "ac2-win64-shipping.exe" in output or "acc.exe" in output
-        except:
-            self.game_running = False
+            output = subprocess.check_output(
+                'tasklist', creationflags=subprocess.CREATE_NO_WINDOW
+            ).decode('mbcs', 'ignore').lower()
+            running = "ac2-win64-shipping.exe" in output or "acc.exe" in output
+        except Exception:
+            running = False
 
-        status_text = "游戏运行中" if self.game_running else "游戏未启动"
-        color = "#32cd32" if self.game_running else "#aaaaaa"
-        self.status_bar.setText(status_text)
-        self.status_bar.setStyleSheet(f"color: {color};")
+        if running != self.game_running:
+            self.game_running = running
+            if running:
+                self.status_bar.setText("游戏运行中")
+                self.status_bar.setStyleSheet(
+                    "color: #4ade80; font-family: 'Microsoft YaHei'; font-size: 10px; font-weight: bold;"
+                )
+                self.status_dot.setStyleSheet("background-color: #4ade80; border-radius: 3px;")
+            else:
+                self.status_bar.setText("游戏未启动")
+                self.status_bar.setStyleSheet(
+                    f"color: {TEXT_SECONDARY}; font-family: 'Microsoft YaHei'; font-size: 10px;"
+                )
+                self.status_dot.setStyleSheet("background-color: #52525b; border-radius: 3px;")
 
-    def handle_toggle(self, is_on, key, switch_widget):
+    def handle_toggle(self, is_on, key):
         if is_on:
             self.start_module(key)
         else:
@@ -200,40 +330,32 @@ class ACCControlPanel(QMainWindow):
                     self.switches[key].set_state(False)
 
     def start_module(self, key):
-        # 判断是否运行在 PyInstaller 打包后的环境中
         if getattr(sys, 'frozen', False):
-            # 如果是 exe 环境，直接调用打包后的子程序 exe
-            # 假设子程序打包后叫 ACC_Overlay.exe
             cmd = ["ACC_Overlay.exe", key]
         else:
-            # 源码环境：使用绝对路径
             script_dir = os.path.dirname(os.path.abspath(__file__))
             script = os.path.join(script_dir, "overlay.py")
-            python_exe = sys.executable
-            cmd = [python_exe, script, key]
-
+            cmd = [sys.executable, script, key]
         try:
-            self.processes[key] = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.processes[key] = subprocess.Popen(
+                cmd, creationflags=subprocess.CREATE_NO_WINDOW
+            )
         except Exception as e:
-            self.status_bar.setText("启动失败")
             print(f"启动错误: {e}")
 
     def stop_module(self, key):
         p = self.processes[key]
         if p:
             try:
-                # /F 强制终止，/T 杀死进程树（连同被 PyInstaller 引导程序派生出的真实进程一起干掉）
                 subprocess.run(
                     ['taskkill', '/F', '/T', '/PID', str(p.pid)],
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
             except Exception:
-                # 兜底方案，万一 taskkill 失败则调用原生的 terminate
                 p.terminate()
             self.processes[key] = None
 
     def closeEvent(self, event):
-        # 主窗口关闭时，也要确保所有的子模块被彻底干净地清理
         for p in self.processes.values():
             if p:
                 try:
