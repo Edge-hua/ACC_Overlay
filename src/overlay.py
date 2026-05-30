@@ -1168,7 +1168,7 @@ class ACCRadarOverlay(OverlayBase):
         self.data_timer = QTimer(self)
         self.data_timer.timeout.connect(self.update_radar_state)
         self.data_timer.start(30)
-        self.damage_scale = 6.5
+        self.damage_scale = 7.08
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
@@ -1508,6 +1508,9 @@ class ACCDeltaBar(OverlayBase):
                     self.delta_time = 0.0
                 else:
                     self.delta_time = raw_delta / 1000.0
+
+                # 超过 ±20 秒后不再继续累加显示（比赛结束/飞行圈收工后）
+                self.delta_time = max(-20.0, min(20.0, self.delta_time))
         except Exception:
             self.is_connected = False
         finally:

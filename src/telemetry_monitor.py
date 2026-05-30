@@ -1,5 +1,5 @@
-"""实时打印油门/刹车深度百分比，以及 ABS/TC 触发信息。
-直接读取 ACC 共享内存，游戏先运行或后运行均可正常打印。
+"""实时打印进站修复耗时。
+通过车损原始值估算，直接读取 ACC 共享内存。
 """
 
 import ctypes
@@ -109,15 +109,11 @@ def open_shm():
     return None
 
 
+DAMAGE_SCALE = 7.08  # 车损→修复秒数换算系数（实测拟合）
+
 def main():
-    print("ACC 遥测监控")
-    print("油门 = 油门踏板深度百分比")
-    print("刹车 = 刹车踏板深度百分比")
-    print("ABS  = 防抱死系统是否触发")
-    print("TC   = 牵引力控制系统是否触发")
+    print("ACC 进站耗时监控（估算）")
     print("等待 ACC 游戏…")
-    print(f"{'油门':>6} {'刹车':>6} {'ABS':>6} {'TC':>6}")
-    print("-" * 28)
 
     shm = None
     prev_packet = -1
@@ -145,14 +141,13 @@ def main():
             continue
         prev_packet = data.packetId
 
-        gas_pct = data.gas * 100
-        brake_pct = data.brake * 100
-        abs_on = "触发" if data.abs > 0.01 else "—"
-        tc_on = "触发" if data.tc > 0.01 else "—"
+        total_raw = sum(data.carDamage[:5])
+        repair_sec = total_raw / DAMAGE_SCALE
 
-        print(f"{gas_pct:5.0f}% {brake_pct:5.0f}%  {abs_on:>4}  {tc_on:>4}")
+        bar = "█" * int(min(repair_sec, 20)) + "░" * (20 - int(min(repair_sec, 20)))
+        print(f"修复耗时: {repair_sec:>5.1f}s  {bar}")
 
-        time.sleep(0.05)
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":
