@@ -18,6 +18,7 @@ __all__ = [
     "EntryListCar",
     "TrackData",
     "BroadcastingEvent",
+    "PitStrategy",
 ]
 
 
@@ -247,6 +248,28 @@ class TrackData(object):
             args.extend(receiveMethod("s" * args[-1]))
         args.extend(receiveMethod("B"))
         args.extend(receiveMethod("s" * args[-1]))
+        return args
+
+
+class PitStrategy(object):
+    """ACC 进站策略：轮胎更换、刹车更换、悬架修复、车身修复"""
+    def __init__(self, *args):
+        args = list(args)
+        self.carIndex = args.pop(0)
+        self.tyreChange = bool(args.pop(0))
+        self.brakeChange = bool(args.pop(0))
+        self.suspensionRepair = bool(args.pop(0))
+        self.bodyRepair = bool(args.pop(0))
+        self.fuelToAdd = args.pop(0) if args else 0.0
+        self._leftovers = args
+
+    @classmethod
+    def receive(cls, receiveMethod):
+        return cls(*cls.receive_args(receiveMethod))
+
+    @staticmethod
+    def receive_args(receiveMethod):
+        args = receiveMethod("HBBBBf")
         return args
 
 

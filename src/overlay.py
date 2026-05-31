@@ -1139,13 +1139,110 @@ class ACCOverlay(OverlayBase):
         self.update()
 
 
+# ==================== 赛道圈速 & 维修区数据（雷达用） ====================
+DEFAULT_LAP_TIMES = {
+    "Misano World Circuit": "1:34.35", "Silverstone Circuit": "1:59.85",
+    "Circuit Paul Ricard": "1:54.75", "Circuit de Barcelona-Catalunya": "1:46.59",
+    "Brands Hatch": "1:26.70", "Hungaroring": "1:46.08",
+    "Autodromo Nazionale Monza": "1:48.63", "Nürburgring Grand Prix Circuit": "1:55.77",
+    "Circuit de Spa-Francorchamps": "2:18.72", "Circuit Zandvoort": "1:37.41",
+    "Circuit Zolder": "1:29.76", "Kyalami Grand Prix Circuit": "1:42.00",
+    "Suzuka Circuit": "2:01.38", "WeatherTech Raceway Laguna Seca": "1:23.13",
+    "Mount Panorama Circuit, Bathurst": "2:02.40",
+    "Autodromo Enzo e Dino Ferrari (Imola)": "1:41.49",
+    "Donington Park": "1:28.74", "Oulton Park": "1:29.25",
+    "Snetterton Circuit": "1:48.12", "Watkins Glen International": "1:45.06",
+    "Circuit of the Americas (COTA)": "2:09.54", "Indianapolis Motor Speedway": "1:36.90",
+    "Circuit Ricardo Tormo (Valencia)": "1:32.31", "Red Bull Ring": "1:29.25",
+    "Nürburgring 24h Circuit": "8:14.70",
+}
+PIT_LANE_TIMES = {
+    "Circuit de Spa-Francorchamps": 71.6, "Silverstone Circuit": 69.8,
+    "Circuit Zandvoort": 52.6, "Circuit Ricardo Tormo (Valencia)": 47.3,
+    "Circuit de Barcelona-Catalunya": 39.5, "Autodromo Enzo e Dino Ferrari (Imola)": 39.5,
+    "Misano World Circuit": 30.0, "Circuit Zolder": 29.0,
+    "Suzuka Circuit": 28.4, "Kyalami Grand Prix Circuit": 27.2,
+    "Circuit Paul Ricard": 27.0, "Circuit of the Americas (COTA)": 25.0,
+    "Donington Park": 25.0, "Brands Hatch Circuit": 25.0,
+    "Autodromo Nazionale Monza": 24.3, "Nürburgring Grand Prix Circuit": 22.5,
+    "Nürburgring 24h Circuit": 22.5, "Hungaroring": 21.9,
+    "Red Bull Ring": 20.3, "WeatherTech Raceway Laguna Seca": 20.0,
+    "Mount Panorama Circuit, Bathurst": 20.0, "Watkins Glen International": 20.0,
+    "Indianapolis Motor Speedway": 20.0, "Snetterton Circuit": 19.0,
+    "Oulton Park": 13.0,
+}
+_GENERIC_WORDS = {
+    "circuit", "circuito", "autodromo", "nazionale", "track", "raceway",
+    "grand", "prix", "international", "world", "park", "de", "del", "di",
+    "of", "the", "mount", "panorama", "weathertech", "cota",
+    "enzo", "e", "dino", "speedway", "centre", "center",
+    "ricardo", "tormo", "ferrari",
+}
+
+
+def _normalize_track(name):
+    s = name.lower()
+    for ch in "-_'.,:;!?()[]":
+        s = s.replace(ch, " ")
+    words = s.split()
+    return frozenset(w for w in words if w not in _GENERIC_WORDS and len(w) > 1)
+
+
+_NORM_IDX_LAP = {_normalize_track(k): k for k in DEFAULT_LAP_TIMES}
+_NORM_IDX_PIT = {_normalize_track(k): k for k in PIT_LANE_TIMES}
+
+
+def _resolve_key(idx, raw):
+    sig = _normalize_track(raw)
+    return idx.get(sig)
+
+
+def _shorten_name(raw):
+    """从 ACC 赛道名提取简短名称"""
+    s = raw.strip()
+    prefixes = [
+        "Circuit de ", "Circuito de ", "Autodromo Nazionale ",
+        "Autodromo Enzo e Dino Ferrari (", "Autodromo ",
+        "WeatherTech Raceway ", "Mount Panorama Circuit, ",
+        "Circuit of the Americas (", "Circuit Ricardo Tormo (",
+    ]
+    for p in prefixes:
+        if s.startswith(p):
+            s = s[len(p):]
+            s = s.rstrip(")")
+            break
+    suffixes = [
+        " Grand Prix Circuit", " World Circuit", " Circuit",
+        " Motor Speedway", " International", " Park",
+    ]
+    for suf in suffixes:
+        if s.endswith(suf):
+            s = s[:-len(suf)]
+            break
+    return s
+
+
+def parse_laptime(t):
+    parts = t.replace(",", ".").split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    elif len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    return float(parts[0])
+
+
 # ==========================================================
 # 模块 4：相对雷达 (含赛车车损换算)
 # ==========================================================
 class ACCRadarOverlay(OverlayBase):
     def __init__(self):
         super().__init__("radar", 250, 250, 0.85)
-        self.pit_loss_val = 5
+        self.pit_coeff = 0.0
+        self.pit_total_sec = 0.0
+        self._lap_sec = 0.0
+        self._pit_lane_sec = None
+        self._track_display = ""
+        self._tire_change = True
         self.center_x = self.width() / 2
         self.center_y = self.height() / 2
         self.radius = 90
@@ -1156,9 +1253,6 @@ class ACCRadarOverlay(OverlayBase):
 
         # 车损数据 [Front, Rear, Left, Right, Center]
         self.car_damage = [0.0, 0.0, 0.0, 0.0, 0.0]
-
-        # [核心换算系数]
-        # ACC 物理遥测输出的是车体形变点数，而非直接的修复秒数。
 
         self.last_data_time = time.time()
         self.last_reconnect_time = time.time()
@@ -1171,12 +1265,14 @@ class ACCRadarOverlay(OverlayBase):
         self.damage_scale = 7.08
 
     def wheelEvent(self, event):
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self.pit_loss_val = min(10, self.pit_loss_val + 1)
-        elif delta < 0:
-            self.pit_loss_val = max(0, self.pit_loss_val - 1)
-        self.update()
+        pass
+
+    def mouseReleaseEvent(self, event):
+        dx = event.position().x() - self.center_x
+        dy = event.position().y() - self.center_y
+        if dx * dx + dy * dy <= self.radius * self.radius:
+            self._tire_change = not self._tire_change
+            self.update()
 
     def connect_client(self):
         if self.client is not None:
@@ -1187,10 +1283,30 @@ class ACCRadarOverlay(OverlayBase):
         self.client = AccClient()
         self.client.onRealtimeUpdate.subscribe(self.on_global_update)
         self.client.onRealtimeCarUpdate.subscribe(self.on_car_update)
+        self.client.onTrackDataUpdate.subscribe(self.on_track_data)
         try:
             self.client.start(ACC_IP, ACC_PORT, ACC_PASSWORD)
         except Exception:
             pass
+
+    def on_track_data(self, event):
+        raw_name = event.content.trackName
+        if not raw_name:
+            return
+        self._track_display = _shorten_name(raw_name)
+        lap_key = _resolve_key(_NORM_IDX_LAP, raw_name)
+        pit_key = _resolve_key(_NORM_IDX_PIT, raw_name)
+        if lap_key and pit_key:
+            self._lap_sec = parse_laptime(DEFAULT_LAP_TIMES[lap_key])
+            self._pit_lane_sec = PIT_LANE_TIMES[pit_key]
+        self.update()
+
+    def _update_pit_total(self):
+        if self._lap_sec and self._pit_lane_sec is not None:
+            dmg_sec = sum(self.car_damage) / self.damage_scale
+            stop_sec = 30.0 if self._tire_change else 15.0
+            self.pit_total_sec = self._pit_lane_sec + stop_sec + dmg_sec
+            self.pit_coeff = self.pit_total_sec / self._lap_sec
 
     def on_global_update(self, event: Event):
         self.last_data_time = time.time()
@@ -1216,6 +1332,7 @@ class ACCRadarOverlay(OverlayBase):
             if physics.packetId > 0:
                 for i in range(5):
                     self.car_damage[i] = physics.carDamage[i]
+                self._update_pit_total()
             else:
                 for i in range(5):
                     self.car_damage[i] = 0.0
@@ -1293,12 +1410,29 @@ class ACCRadarOverlay(OverlayBase):
         else:
             my_spline = self.track_data[self.my_car_index]
 
-            if self.pit_loss_val > 0:
+            if self.pit_coeff > 0:
                 arc_pen = QPen(QColor("#6a3812"), 14)
                 painter.setPen(arc_pen)
                 painter.drawArc(
                     QRectF(self.center_x - self.radius, self.center_y - self.radius, self.radius * 2, self.radius * 2),
-                    90 * 16, self.pit_loss_val * 12 * 16)
+                    90 * 16, int(360 * self.pit_coeff * 16))
+
+            # --- 赛道名 ---
+            if self._track_display:
+                self.draw_text(painter, self.center_x, self.center_y - 50, self._track_display, "Microsoft YaHei", 10,
+                               "#aaaaaa", "bold")
+
+            # --- 换胎开关（车损左侧） ---
+            # 竖向换胎开关（圆环与车损之间）
+            tx = self.center_x - 52
+            ty0 = self.center_y - 22
+            ty1 = self.center_y - 8
+            if self._tire_change:
+                self.draw_text(painter, tx, ty0, "▎换胎", "Microsoft YaHei", 10, "#33cc33", "bold")
+                self.draw_text(painter, tx, ty1, "  不换", "Microsoft YaHei", 9, "#555555")
+            else:
+                self.draw_text(painter, tx, ty0, "  换胎", "Microsoft YaHei", 9, "#555555")
+                self.draw_text(painter, tx, ty1, "▎不换", "Microsoft YaHei", 10, "#888888", "bold")
 
             # --- 车损 UI (放大并居中偏上) ---
             cx = self.center_x
@@ -1329,8 +1463,8 @@ class ACCRadarOverlay(OverlayBase):
             # --- 辅助数据整体下移 ---
             self.draw_text(painter, self.center_x, self.center_y + 55, f"Cars: {len(self.track_data)}", "Arial", 9,
                            "#666666")
-            if self.pit_loss_val > 0:
-                self.draw_text(painter, self.center_x, self.center_y + 73, f"Pit: {self.pit_loss_val}", "Arial", 10,
+            if self.pit_coeff > 0:
+                self.draw_text(painter, self.center_x, self.center_y + 73, f"进站耗时:{self.pit_total_sec:.0f}秒", "Microsoft YaHei", 10,
                                "#ff8833", "bold")
 
             # --- 绘制周围车辆 ---

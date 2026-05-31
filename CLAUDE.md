@@ -59,6 +59,8 @@ pyinstaller --onefile --windowed src/main_panel.py  # 需在conda ACC环境下
 - `accapi/client.py` 中的 `ThreadedSocketReader` 使用daemon线程持续读取UDP数据
 - `.claude/settings.local.json` 已配置权限白名单，可直接运行相关命令
 
-python -m PyInstaller --noconsole --onefile --distpath ./ACC_Plugin_Release --name ACC_ControlPanel --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtGui --hidden-import PyQt6.QtWidgets src/main_panel.py
+# 打包前确保在 overlay 环境中（conda activate overlay）
 
-python -m PyInstaller --noconsole --onefile --distpath ./ACC_Plugin_Release --name ACC_Overlay --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtGui --hidden-import PyQt6.QtWidgets src/overlay.py
+python -m PyInstaller --noconsole --onefile --distpath ./ACC_Plugin_Release --name ACC_ControlPanel --icon config/logo.ico --add-data "config/logo.jpg;config" --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtGui --hidden-import PyQt6.QtWidgets src/main_panel.py
+
+python -m PyInstaller --noconsole --onefile --distpath ./ACC_Plugin_Release --name ACC_Overlay --icon config/logo.ico --hidden-import PyQt6 --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtGui --hidden-import PyQt6.QtWidgets src/overlay.py

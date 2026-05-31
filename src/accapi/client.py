@@ -11,6 +11,7 @@ from .structs import (
     EntryListCar,
     TrackData,
     BroadcastingEvent,
+    PitStrategy,
 )
 
 __all__ = ["AccClient"]
@@ -162,6 +163,7 @@ class AccClient(object):
         self._onRealtimeUpdate = Observable()
         self._onRealtimeCarUpdate = Observable()
         self._onBroadcastingEvent = Observable()
+        self._onPitStrategy = Observable()
 
         # Session properties
         self._broadcastingProtocolVersion = 4
@@ -179,6 +181,7 @@ class AccClient(object):
             5: self._receive_track_data,
             6: self._receive_entry_list_car,
             7: self._receive_broadcasting_event,
+            47: self._receive_pit_strategy,
         }
 
         # Thread
@@ -224,6 +227,10 @@ class AccClient(object):
     def onBroadcastingEvent(self):
         return self._onBroadcastingEvent
 
+    @property
+    def onPitStrategy(self):
+        return self._onPitStrategy
+
     def _send(self, *fmtValuePairs):
         if not self.isAlive:
             raise ValueError("Must be started")
@@ -243,6 +250,7 @@ class AccClient(object):
                 values.append(v)
         packed = struct.pack(fmt, *values)
         self._socket.sendto(packed, self._server)
+        return packed
 
     def _receive(self, fmt):
         out = []
@@ -310,6 +318,27 @@ class AccClient(object):
             event = BroadcastingEvent(*args)
             callback(Event(self, event))
 
+    def _receive_pit_strategy(self):
+        raw = self._reader.read(32, timeout=0.3)
+        if raw is None:
+            return
+        print(f"[Pit RAW] {raw.hex()} ({len(raw)} bytes)")
+        # 尝试多种格式解析
+        for name, fmt, sz in [
+            ("HBBBB",  "<HBBBB", 6),
+            ("HBBBBf", "<HBBBBf", 10),
+            ("BBBB",   "<BBBB", 4),
+            ("HBBBBi", "<HBBBBi", 10),
+            ("iBBBB",  "<iBBBB", 8),
+            ("HBBBBff","<HBBBBff", 14),
+        ]:
+            if len(raw) >= sz:
+                try:
+                    vals = struct.unpack(fmt, raw[:sz])
+                    print(f"  try {name}: {vals}")
+                except struct.error:
+                    pass
+
     def _request_connection(self, password: str, commandPassword: str):
         self._send(
             ("B", OutboundMessageTypes.REGISTER_COMMAND_APPLICATION.value),
@@ -376,6 +405,15 @@ class AccClient(object):
             ("s", pageName),
         )
 
+    def request_pit_strategy(self):
+        """查询进站策略（带 carIndex 参数）。"""
+        packed = self._send(
+            ("B", OutboundMessageTypes.GET_PIT_STRATEGY.value),
+            ("i", self._connectionId),
+            ("h", 0),
+        )
+        print(f"[Pit REQ] {packed.hex()} ({len(packed)} bytes)")
+
     def _run(self):
         try:
             while not self._stopSignal:
@@ -387,7 +425,11 @@ class AccClient(object):
                 if messageTypeData is None:
                     continue
                 (messageType,) = struct.unpack("B", messageTypeData)
-                self._receiveMethods[messageType]()
+                handler = self._receiveMethods.get(messageType)
+                if handler:
+                    handler()
+                else:
+                    print(f"[BC] 未处理的入站消息类型: {messageType}")
         finally:
             try:
                 self._request_disconnection()
