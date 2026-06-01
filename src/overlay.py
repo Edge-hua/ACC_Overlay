@@ -11,7 +11,7 @@ from collections import deque
 
 from PyQt6.QtWidgets import QApplication, QWidget
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPolygonF
+from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPolygonF, QLinearGradient
 
 from accapi.client import AccClient, Event
 
@@ -361,14 +361,29 @@ class ACCTimer(OverlayBase):
                 print(f"[Timer 数据解析报错] 车辆数据出错: {e}")
                 traceback.print_exc()
 
-        self._update_global_bests_from_cars()
+        if self._update_global_bests_from_cars():
+            self._recalc_sector_colors()
 
     def _update_global_bests_from_cars(self):
+        changed = False
         for data in self.cars_data.values():
             splits = data.get("splits", [0, 0, 0])
             for i in range(3):
                 if 0 < splits[i] < self.session_global_bests[i]:
                     self.session_global_bests[i] = splits[i]
+                    changed = True
+        return changed
+
+    def _recalc_sector_colors(self):
+        """全局最快变化时重新评估个人分段颜色（紫→绿降级）。"""
+        for i in range(3):
+            pb = self.personal_bests[i]
+            if pb >= 9999999:
+                continue
+            curr = self.sector_colors[i]
+            if curr in ("#c0392b", "#333338"):
+                continue
+            self.sector_colors[i] = "#9b59b6" if pb <= self.session_global_bests[i] else "#2ecc71"
 
     def _merge_realtime_car(self, c):
         def get_attr(obj, names, default=None):
@@ -1149,6 +1164,7 @@ DEFAULT_LAP_TIMES = {
     "Circuit Zolder": "1:29.76", "Kyalami Grand Prix Circuit": "1:42.00",
     "Suzuka Circuit": "2:01.38", "WeatherTech Raceway Laguna Seca": "1:23.13",
     "Mount Panorama Circuit, Bathurst": "2:02.40",
+    "Mount Panorama Circuit": "2:02.40",
     "Autodromo Enzo e Dino Ferrari (Imola)": "1:41.49",
     "Donington Park": "1:28.74", "Oulton Park": "1:29.25",
     "Snetterton Circuit": "1:48.12", "Watkins Glen International": "1:45.06",
@@ -1167,14 +1183,15 @@ PIT_LANE_TIMES = {
     "Autodromo Nazionale Monza": 24.3, "Nürburgring Grand Prix Circuit": 22.5,
     "Nürburgring 24h Circuit": 22.5, "Hungaroring": 21.9,
     "Red Bull Ring": 20.3, "WeatherTech Raceway Laguna Seca": 20.0,
-    "Mount Panorama Circuit, Bathurst": 20.0, "Watkins Glen International": 20.0,
+    "Mount Panorama Circuit, Bathurst": 20.0, "Mount Panorama Circuit": 20.0,
+    "Watkins Glen International": 20.0,
     "Indianapolis Motor Speedway": 20.0, "Snetterton Circuit": 19.0,
     "Oulton Park": 13.0,
 }
 _GENERIC_WORDS = {
     "circuit", "circuito", "autodromo", "nazionale", "track", "raceway",
     "grand", "prix", "international", "world", "park", "de", "del", "di",
-    "of", "the", "mount", "panorama", "weathertech", "cota",
+    "of", "the", "weathertech", "cota",
     "enzo", "e", "dino", "speedway", "centre", "center",
     "ricardo", "tormo", "ferrari",
 }
@@ -1654,13 +1671,196 @@ class ACCDeltaBar(OverlayBase):
         self.update()
 
 # ==========================================================
+# 天气模块
+# ==========================================================
+class ACCWeather(OverlayBase):
+    # 视觉顺序：最差(左)→最优(右)
+    GRIP_ORDER = [6, 5, 4, 3, 0, 1, 2]  # 水淹→湿地→湿滑→半干→绿→快→最佳
+    TRACK_GRIP = {6: "水淹", 5: "湿地", 4: "湿滑", 3: "半干", 0: "绿", 1: "快", 2: "最佳"}
+    RAIN_DESC = {0: "无雨", 1: "毛毛雨", 2: "小雨", 3: "中雨", 4: "大雨", 5: "暴雨"}
+    GRIP_COLORS = {6: "#0D47A1", 5: "#1E88E5", 4: "#42A5F5", 3: "#FFEB3B", 0: "#4CAF50", 1: "#66BB6A", 2: "#00E676"}
+
+    def __init__(self):
+        super().__init__("weather", 240, 44, 0.85)
+        self.refresh_rate = 1000
+        self.is_connected = False
+        self.air_temp = 0
+        self.road_temp = 0
+        self.grip = 3
+        self.rain_now = 0
+        self.rain_10 = 0
+        self.rain_30 = 0
+        self.wind = 0.0
+        self._gfx = None
+        self._gfx_fails = 0
+
+        self._init_gfx()
+
+        self.data_timer = QTimer(self)
+        self.data_timer.timeout.connect(self._update_data)
+        self.data_timer.start(self.refresh_rate)
+
+    def _init_gfx(self):
+        if self._gfx is not None:
+            try:
+                self._gfx.close()
+            except Exception:
+                pass
+            self._gfx = None
+        try:
+            from pyaccsharedmemory import accSharedMemory
+            self._gfx = accSharedMemory()
+        except Exception:
+            pass
+
+    def _update_data(self):
+        try:
+            # 气温/路面温度：直接从物理共享内存读取（mmap，无缓存跳过）
+            connected = False
+            try:
+                shm = mmap.mmap(-1, ctypes.sizeof(SPageFilePhysics),
+                                "acpmf_physics", access=mmap.ACCESS_READ)
+            except FileNotFoundError:
+                shm = mmap.mmap(-1, ctypes.sizeof(SPageFilePhysics),
+                                "Local\\acpmf_physics", access=mmap.ACCESS_READ)
+            try:
+                shm.seek(0)
+                data = shm.read(ctypes.sizeof(SPageFilePhysics))
+                physics = SPageFilePhysics.from_buffer_copy(data)
+                if physics.packetId != 0:
+                    connected = True
+                    self.air_temp = physics.airTemp
+                    self.road_temp = physics.roadTemp
+            finally:
+                try:
+                    shm.close()
+                except Exception:
+                    pass
+
+            # 天气数据（降水/抓地力/风速）：通过 pyaccsharedmemory 读取
+            sm = self._gfx.read_shared_memory() if self._gfx else None
+            if sm is not None:
+                self._gfx_fails = 0
+                connected = True
+                g = sm.Graphics
+                self.grip = g.track_grip_status.value
+                self.rain_now = g.rain_intensity.value
+                self.rain_10 = g.rain_intensity_in_10min.value
+                self.rain_30 = g.rain_intensity_in_30min.value
+                self.wind = g.wind_speed
+            else:
+                self._gfx_fails += 1
+                if self._gfx_fails >= 10:
+                    pass  # graphics 数据可选，不影响连接状态
+            self.is_connected = connected
+        except Exception:
+            self._gfx_fails += 1
+            if self._gfx_fails >= 5:
+                self._init_gfx()
+
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        self.draw_rounded_rect(painter, 1, 1, w - 1, h - 1, 8, "#16161a")
+
+        if not self.is_connected:
+            self.draw_text(painter, w / 2, h / 2, "等待数据...", "Microsoft YaHei", 11, "#666666", "bold")
+            return
+
+        bar_x, bar_w, bar_h = 10, w - 20, 14
+        bar_y = h - bar_h - 5
+
+        # === 顶行：降水预报(左) + 温度(右) ===
+        f = QFont("Microsoft YaHei", 9)
+        painter.setFont(f)
+
+        # 10min 降水
+        painter.setPen(QColor("#88aaff"))
+        painter.drawText(QRectF(10, 2, 18, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "10")
+        painter.setPen(QColor("#cccccc"))
+        painter.drawText(QRectF(28, 2, 30, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         self.RAIN_DESC.get(self.rain_10))
+
+        # 30min 降水
+        painter.setPen(QColor("#88aaff"))
+        painter.drawText(QRectF(58, 2, 18, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "30")
+        painter.setPen(QColor("#cccccc"))
+        painter.drawText(QRectF(76, 2, 30, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         self.RAIN_DESC.get(self.rain_30))
+
+        # 气温赛道温度（右对齐）
+        fb = QFont("Microsoft YaHei", 10, QFont.Weight.Bold)
+        painter.setFont(fb)
+        painter.setPen(QColor("#ffffff"))
+        txt = f"气温:{self.air_temp:.0f}°C  赛道:{self.road_temp:.0f}°C"
+        painter.drawText(QRectF(105, 2, w - 115, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, txt)
+
+        # === 底部：赛道条件进度条（居中双向，左好右差） ===
+        cx = bar_x + bar_w / 2
+        half_max = bar_w / 2 - 4
+
+        # 背景条：渐变色显示完整范围（左绿→中灰→右蓝）
+        bg_grad = QLinearGradient(bar_x, 0, bar_x + bar_w, 0)
+        bg_grad.setColorAt(0, QColor(76, 175, 80, 50))    # 绿（透底）
+        bg_grad.setColorAt(0.48, QColor(40, 40, 50, 80))
+        bg_grad.setColorAt(0.52, QColor(40, 40, 50, 80))
+        bg_grad.setColorAt(1, QColor(13, 71, 161, 50))   # 蓝（透底）
+        painter.setBrush(QBrush(bg_grad))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 3, 3)
+
+        # 填充条：从中心向当前条件方向高亮
+        gi = self.GRIP_ORDER.index(self.grip)
+        center_idx = 3.5
+        dist = gi - center_idx
+        max_dist = center_idx if dist < 0 else (len(self.GRIP_ORDER) - 1 - center_idx)
+        fill_len = int(abs(dist) / max_dist * half_max) or 4
+
+        if fill_len > 0:
+            if dist < 0:  # 差 → 蓝色向左
+                fill_rect = QRectF(cx - fill_len, bar_y, fill_len, bar_h)
+            else:  # 好 → 绿色向右
+                fill_rect = QRectF(cx, bar_y, fill_len, bar_h)
+            c = QColor(self.GRIP_COLORS[self.grip])
+            painter.setBrush(c)
+            painter.drawRoundedRect(fill_rect, 3, 3)
+            # 高光渐变
+            hl = QLinearGradient(0, bar_y, 0, bar_y + bar_h)
+            hl.setColorAt(0, QColor(255, 255, 255, 60))
+            hl.setColorAt(0.5, QColor(255, 255, 255, 30))
+            hl.setColorAt(1, QColor(0, 0, 0, 40))
+            painter.setBrush(QBrush(hl))
+            painter.drawRoundedRect(fill_rect, 3, 3)
+
+        # 中心标记
+        painter.setBrush(QColor(150, 150, 150, 180))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(QRectF(cx - 1.5, bar_y + 3, 3, bar_h - 6), 1, 1)
+
+        # 赛道条件文字（条内居中，加阴影提高可读性）
+        f3 = QFont("Microsoft YaHei", 9)
+        painter.setFont(f3)
+        label = f"{self.RAIN_DESC.get(self.rain_now)}  {self.TRACK_GRIP.get(self.grip)}"
+        # 阴影
+        painter.setPen(QColor(0, 0, 0, 120))
+        painter.drawText(QRectF(bar_x + 1, bar_y + 1, bar_w, bar_h), Qt.AlignmentFlag.AlignCenter, label)
+        # 前景
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(QRectF(bar_x, bar_y, bar_w, bar_h), Qt.AlignmentFlag.AlignCenter, label)
+
+
+# ==========================================================
 # 启动路由
 # ==========================================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     if len(sys.argv) < 2:
-        print("请提供启动模块: radar, overlay, tyres, timer, delta")
+        print("请提供启动模块: radar, overlay, tyres, timer, delta, weather")
         sys.exit(1)
 
     module_to_run = sys.argv[1]
@@ -1675,6 +1875,8 @@ if __name__ == "__main__":
         window = ACCTimer()
     elif module_to_run == "delta":
         window = ACCDeltaBar()
+    elif module_to_run == "weather":
+        window = ACCWeather()
     else:
         print(f"未知模块: {module_to_run}")
         sys.exit(1)

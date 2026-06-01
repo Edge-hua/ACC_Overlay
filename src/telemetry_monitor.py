@@ -1,4 +1,4 @@
-"""通过 ACC UDP 广播协议打印赛道名称及进站用时系数。"""
+"""通过 ACC UDP 广播协议打印赛道名称及进站用时系数，以及共享内存天气数据。"""
 
 import sys
 import time
@@ -6,6 +6,13 @@ import signal
 
 sys.path.insert(0, r"C:\Users\hzq\Desktop\overlay\src")
 from accapi.client import AccClient
+
+# 可选天气数据（共享内存）
+try:
+    from pyaccsharedmemory import accSharedMemory
+    HAS_SM = True
+except ImportError:
+    HAS_SM = False
 
 # 默认圈速参考（秒），key 为 ACC 广播协议返回的赛道名
 DEFAULT_LAP_TIMES = {
@@ -74,11 +81,13 @@ _GENERIC = {
     "ricardo", "tormo", "ferrari",
 }
 
+RAIN_NAMES = {0: "无雨", 1: "毛毛雨", 2: "小雨", 3: "中雨", 4: "大雨", 5: "暴雨"}
+TRACK_GRIP_NAMES = {0: "新路", 1: "快", 2: "最佳", 3: "湿滑", 4: "半干", 5: "湿地", 6: "水淹"}
+
 
 def _normalize(name):
     """提取赛道名的关键特征词，忽略通用词"""
     s = name.lower()
-    # 替换分隔符为空格
     for ch in "-_'.,:;!?()[]":
         s = s.replace(ch, " ")
     words = s.split()
@@ -99,23 +108,19 @@ for key in PIT_LANE_TIMES:
 
 
 def _resolve_index(idx, raw):
-    """通过归一化特征词匹配，在索引中查找 key"""
     sig = _normalize(raw)
     return idx.get(sig)
 
 
 def resolve_track_name(raw):
-    """将 ACC 赛道名转为 DEFAULT_LAP_TIMES 中的 key"""
     return _resolve_index(_NORM_INDEX, raw) or raw
 
 
 def resolve_pit_key(raw):
-    """将 ACC 赛道名转为 PIT_LANE_TIMES 中的 key"""
     return _resolve_index(_PIT_NORM_INDEX, raw) or raw
 
 
 def parse_laptime(t):
-    """将 '1:46.59' 格式转为秒数 float"""
     parts = t.replace(",", ".").split(":")
     if len(parts) == 2:
         return int(parts[0]) * 60 + float(parts[1])
@@ -124,14 +129,79 @@ def parse_laptime(t):
     return float(parts[0])
 
 
+# ------------------------------ 共享内存天气读取 ------------------------------
+
+_sm_reader = None
+_sm_failures = 0
+
+
+def _init_sm():
+    global _sm_reader
+    if not HAS_SM:
+        return
+    try:
+        if _sm_reader is not None:
+            _sm_reader.close()
+    except Exception:
+        pass
+    try:
+        _sm_reader = accSharedMemory()
+    except Exception:
+        _sm_reader = None
+
+
+def _read_weather():
+    """从共享内存读取天气数据，返回字典或 None"""
+    global _sm_reader, _sm_failures
+    if not HAS_SM:
+        return None
+    if _sm_reader is None:
+        _init_sm()
+    if _sm_reader is None:
+        return None
+    try:
+        sm = _sm_reader.read_shared_memory()
+        if sm is None:
+            _sm_failures += 1
+            if _sm_failures >= 3:
+                _init_sm()  # 重建共享内存连接
+            return None
+        _sm_failures = 0
+        g = sm.Graphics
+        p = sm.Physics
+        rn = g.rain_intensity
+        r10 = g.rain_intensity_in_10min
+        r30 = g.rain_intensity_in_30min
+        grip = g.track_grip_status
+
+        return {
+            "rain_now": rn.value if hasattr(rn, "value") else rn,
+            "rain_10": r10.value if hasattr(r10, "value") else r10,
+            "rain_30": r30.value if hasattr(r30, "value") else r30,
+            "grip": grip.value if hasattr(grip, "value") else grip,
+            "wind_speed": g.wind_speed,
+            "air_temp": p.air_temp,
+            "road_temp": p.road_temp,
+        }
+    except Exception:
+        _sm_failures += 1
+        if _sm_failures >= 3:
+            _init_sm()
+        return None
+
+
+# ---------------------------------------------------------------------------
+
 def main():
     HOST = "127.0.0.1"
     PORT = 9000
     PASSWORD = "asd"
 
     client = None
-    last_poll = 0.0
+    last_poll = 0.0    # track data poll
+    last_wx_poll = 0.0  # weather poll
     last_name = ""
+    _last_wx_key = None  # 避免重复打印相同天气
 
     def on_track_data(event):
         nonlocal last_name
@@ -169,13 +239,41 @@ def main():
         c.start(HOST, PORT, PASSWORD)
         client = c
 
+    def _print_weather(wx):
+        """打印一行天气信息"""
+        rn, r10, r30 = wx["rain_now"], wx["rain_10"], wx["rain_30"]
+        grip = wx["grip"]
+        wind = wx["wind_speed"]
+        air_t = wx["air_temp"]
+        road_t = wx["road_temp"]
+
+        now_desc = RAIN_NAMES.get(rn, f"未知({rn})")
+        parts = [
+            f"当前: {now_desc}",
+            f"10min: {RAIN_NAMES.get(r10, str(r10))}",
+            f"30min: {RAIN_NAMES.get(r30, str(r30))}",
+        ]
+
+        line = f"  天气: {' → '.join(parts)}  赛道: {TRACK_GRIP_NAMES.get(grip, grip)}"
+        line += f"  |  气温: {air_t:.0f}°C  路面: {road_t:.0f}°C"
+        if wind:
+            line += f"  风速: {wind:.1f}km/h"
+        print(line)
+
     print(f"连接 ACC 广播服务 {HOST}:{PORT}…")
+    if not HAS_SM:
+        print("(未安装 pyaccsharedmemory，无天气数据)")
     start_client()
 
     def cleanup(*_):
         print("\n正在退出…")
         if client and client.isAlive:
             client.stop()
+        if _sm_reader:
+            try:
+                _sm_reader.close()
+            except Exception:
+                pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup)
@@ -195,6 +293,18 @@ def main():
             if now - last_poll >= 5:
                 client._request_track_data()
                 last_poll = now
+
+        # 每 3 秒刷天气
+        now = time.time()
+        if now - last_wx_poll >= 3:
+            last_wx_poll = now
+            wx = _read_weather()
+            if wx:
+                key = (wx["rain_now"], wx["rain_10"], wx["rain_30"], wx["grip"],
+                       round(wx["air_temp"], 1), round(wx["road_temp"], 1))
+                if key != _last_wx_key:
+                    _last_wx_key = key
+                    _print_weather(wx)
 
 
 if __name__ == "__main__":
