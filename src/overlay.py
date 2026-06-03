@@ -381,7 +381,7 @@ class ACCTimer(OverlayBase):
             if pb >= 9999999:
                 continue
             curr = self.sector_colors[i]
-            if curr in ("#c0392b", "#333338"):
+            if curr not in ("#9b59b6", "#2ecc71"):
                 continue
             self.sector_colors[i] = "#9b59b6" if pb <= self.session_global_bests[i] else "#2ecc71"
 
